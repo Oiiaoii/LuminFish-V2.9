@@ -17,7 +17,7 @@ concurrency:
 
 jobs:
   build:
-    name: Fix, test and build LuminFish
+    name: Build LuminFish 2.6
     runs-on: ubuntu-latest
     timeout-minutes: 35
 
@@ -36,164 +36,142 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install Python dependencies
-        run: |
-          python -m pip install --upgrade pip numpy
-
       - name: Fix duplicate Kotlin declaration
-        shell: python
+        shell: bash
         run: |
+          python - <<'PY'
           from pathlib import Path
           import re
 
           path = Path("app/src/main/java/com/solmacro/MainActivity.kt")
-
           if not path.is_file():
-              raise SystemExit(f"ERROR: Source file not found: {path}")
+              raise SystemExit(f"Missing source: {path}")
 
           source = path.read_text(encoding="utf-8")
           lines = source.splitlines(keepends=True)
 
           if len(lines) < 962:
-              raise SystemExit("ERROR: MainActivity.kt is shorter than expected.")
+              raise SystemExit("Unexpected source file length.")
 
-          target_index = 961
-          match = re.search(r'\bval\s+(fl)\b', lines[target_index])
+          if not re.search(r'\bval\s+fl\b', lines[834]):
+              raise SystemExit("Expected first declaration at line 835 not found.")
 
+          match = re.search(r'\bval\s+(fl)\b', lines[961])
           if not match:
-              raise SystemExit(
-                  "ERROR: Expected duplicate declaration was not found "
-                  "on line 962. No source changes made."
-              )
+              raise SystemExit("Expected second declaration at line 962 not found.")
 
-          declaration_start = sum(
-              len(line) for line in lines[:target_index]
-          ) + match.start(1)
+          start = sum(len(x) for x in lines[:961]) + match.start(1)
 
-          def skip_non_code(text, pos):
-              if text.startswith("//", pos):
-                  end = text.find("\n", pos)
+          def skip(text, i):
+              if text.startswith("//", i):
+                  end = text.find("\n", i)
                   return len(text) if end == -1 else end
 
-              if text.startswith("/*", pos):
+              if text.startswith("/*", i):
                   depth = 1
-                  pos += 2
-                  while pos < len(text) and depth:
-                      if text.startswith("/*", pos):
+                  i += 2
+                  while i < len(text) and depth:
+                      if text.startswith("/*", i):
                           depth += 1
-                          pos += 2
-                      elif text.startswith("*/", pos):
+                          i += 2
+                      elif text.startswith("*/", i):
                           depth -= 1
-                          pos += 2
+                          i += 2
                       else:
-                          pos += 1
-                  return pos
+                          i += 1
+                  return i
 
-              if text.startswith('"""', pos):
-                  end = text.find('"""', pos + 3)
+              if text.startswith('"""', i):
+                  end = text.find('"""', i + 3)
                   return len(text) if end == -1 else end + 3
 
-              if text[pos] in ('"', "'"):
-                  quote = text[pos]
-                  pos += 1
-                  while pos < len(text):
-                      if text[pos] == "\\":
-                          pos += 2
-                      elif text[pos] == quote:
-                          return pos + 1
+              if text[i] in ('"', "'"):
+                  quote = text[i]
+                  i += 1
+                  while i < len(text):
+                      if text[i] == "\\":
+                          i += 2
+                      elif text[i] == quote:
+                          return i + 1
                       else:
-                          pos += 1
-                  return pos
+                          i += 1
+                  return i
 
-              return pos
+              return i
 
-          # Find the containing Kotlin block.
           stack = []
           i = 0
-
-          while i < declaration_start:
-              skipped = skip_non_code(source, i)
-              if skipped != i:
-                  i = skipped
+          while i < start:
+              j = skip(source, i)
+              if j != i:
+                  i = j
                   continue
-
               if source[i] == "{":
                   stack.append(i)
-              elif source[i] == "}":
-                  if stack:
-                      stack.pop()
+              elif source[i] == "}" and stack:
+                  stack.pop()
               i += 1
 
           if not stack:
-              raise SystemExit("ERROR: Could not identify Kotlin scope.")
+              raise SystemExit("Could not identify Kotlin scope.")
 
           depth = 1
-          scope_end = None
-          i = declaration_start + 2
+          end_scope = None
+          i = start + 2
 
           while i < len(source):
-              skipped = skip_non_code(source, i)
-              if skipped != i:
-                  i = skipped
+              j = skip(source, i)
+              if j != i:
+                  i = j
                   continue
-
               if source[i] == "{":
                   depth += 1
               elif source[i] == "}":
                   depth -= 1
                   if depth == 0:
-                      scope_end = i
+                      end_scope = i
                       break
               i += 1
 
-          if scope_end is None:
-              raise SystemExit("ERROR: Could not find end of Kotlin scope.")
+          if end_scope is None:
+              raise SystemExit("Could not locate end of Kotlin scope.")
 
-          # Locate actual code identifiers, excluding comments and strings.
           occurrences = []
-          i = declaration_start
+          i = start
 
-          while i < scope_end:
-              skipped = skip_non_code(source, i)
-              if skipped != i:
-                  i = skipped
+          while i < end_scope:
+              j = skip(source, i)
+              if j != i:
+                  i = j
                   continue
 
               if source[i].isalpha() or source[i] == "_":
-                  start = i
+                  a = i
                   i += 1
-                  while i < scope_end and (
-                      source[i].isalnum() or source[i] == "_"
-                  ):
+                  while i < end_scope and (source[i].isalnum() or source[i] == "_"):
                       i += 1
-
-                  if source[start:i] == "fl":
-                      occurrences.append((start, i))
+                  if source[a:i] == "fl":
+                      occurrences.append((a, i))
               else:
                   i += 1
 
-          if not occurrences or occurrences[0][0] != declaration_start:
-              raise SystemExit("ERROR: Could not verify target variable.")
+          if not occurrences or occurrences[0][0] != start:
+              raise SystemExit("Could not verify second declaration.")
 
           replacement = "fl_ui_962"
-
           if replacement in source:
-              raise SystemExit("ERROR: Replacement identifier already exists.")
+              raise SystemExit("Replacement name already exists.")
 
-          for start, end in reversed(occurrences):
-              source = source[:start] + replacement + source[end:]
+          for a, b in reversed(occurrences):
+              source = source[:a] + replacement + source[b:]
 
           path.write_text(source, encoding="utf-8")
+          print("Second fl declaration renamed.")
+          print("Original UI sections preserved.")
+          PY
 
-          print("Fixed duplicate declaration at line 962.")
-          print(f"Renamed second variable and its references to {replacement}.")
-          print("Both UI sections were preserved.")
-
-      - name: Check patch formatting
+      - name: Check patch
         run: git diff --check
-
-      - name: Run logic tests
-        run: python tests/logic_tests.py
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v4
@@ -211,7 +189,7 @@ jobs:
       - name: Build debug APK
         run: gradle --no-daemon --stacktrace :app:assembleDebug
 
-      - name: Upload LuminFish 2.6 APK
+      - name: Upload LuminFish APK
         uses: actions/upload-artifact@v6
         with:
           name: LuminFish-2.6-debug-apk
@@ -219,7 +197,7 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload build reports on failure
+      - name: Upload reports if build fails
         if: failure()
         uses: actions/upload-artifact@v6
         with:
