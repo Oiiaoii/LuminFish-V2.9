@@ -1,67 +1,231 @@
-name: Build APK
+
+name: Build LuminFish 2.6 APK
+
 on:
   workflow_dispatch:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
+
 permissions:
   contents: read
+
 concurrency:
-  group: build-${{ github.ref }}
+  group: luminfish-build-${{ github.ref }}
   cancel-in-progress: true
+
 jobs:
   build:
+    name: Fix, test and build LuminFish
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout project
+        uses: actions/checkout@v7
 
-      - name: Find the Android project folder
-        id: find
-        shell: bash
-        run: |
-          dir=""
-          while IFS= read -r f; do
-            d=$(dirname "$f")
-            if [ -f "$d/build.gradle.kts" ] && [ -f "$d/app/build.gradle.kts" ]; then
-              dir="$d"
-              break
-            fi
-          done < <(find . -name settings.gradle.kts -not -path './.git/*' | sort)
-          if [ -z "$dir" ]; then
-            echo "::error::No Android project found (a folder with settings.gradle.kts, build.gradle.kts and app/build.gradle.kts)."
-            echo "Repository files:"
-            find . -maxdepth 3 -not -path './.git/*' | sort | head -80
-            exit 1
-          fi
-          echo "Android project folder: $dir"
-          echo "dir=$dir" >> "$GITHUB_OUTPUT"
-
-      - uses: actions/setup-java@v4
+      - name: Set up Java 17
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
-          java-version: 17
+          java-version: '17'
 
-      - uses: gradle/actions/setup-gradle@v3
+      - name: Set up Python
+        uses: actions/setup-python@v7
         with:
-          gradle-version: 8.9
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip numpy
+
+      - name: Fix duplicate Kotlin declaration
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          path = Path("app/src/main/java/com/solmacro/MainActivity.kt")
+
+          if not path.is_file():
+              raise SystemExit(f"ERROR: Source file not found: {path}")
+
+          source = path.read_text(encoding="utf-8")
+          lines = source.splitlines(keepends=True)
+
+          if len(lines) < 962:
+              raise SystemExit("ERROR: MainActivity.kt is shorter than expected.")
+
+          target_index = 961
+          match = re.search(r'\bval\s+(fl)\b', lines[target_index])
+
+          if not match:
+              raise SystemExit(
+                  "ERROR: Expected duplicate declaration was not found "
+                  "on line 962. No source changes made."
+              )
+
+          declaration_start = sum(
+              len(line) for line in lines[:target_index]
+          ) + match.start(1)
+
+          def skip_non_code(text, pos):
+              if text.startswith("//", pos):
+                  end = text.find("\n", pos)
+                  return len(text) if end == -1 else end
+
+              if text.startswith("/*", pos):
+                  depth = 1
+                  pos += 2
+                  while pos < len(text) and depth:
+                      if text.startswith("/*", pos):
+                          depth += 1
+                          pos += 2
+                      elif text.startswith("*/", pos):
+                          depth -= 1
+                          pos += 2
+                      else:
+                          pos += 1
+                  return pos
+
+              if text.startswith('"""', pos):
+                  end = text.find('"""', pos + 3)
+                  return len(text) if end == -1 else end + 3
+
+              if text[pos] in ('"', "'"):
+                  quote = text[pos]
+                  pos += 1
+                  while pos < len(text):
+                      if text[pos] == "\\":
+                          pos += 2
+                      elif text[pos] == quote:
+                          return pos + 1
+                      else:
+                          pos += 1
+                  return pos
+
+              return pos
+
+          # Find the containing Kotlin block.
+          stack = []
+          i = 0
+
+          while i < declaration_start:
+              skipped = skip_non_code(source, i)
+              if skipped != i:
+                  i = skipped
+                  continue
+
+              if source[i] == "{":
+                  stack.append(i)
+              elif source[i] == "}":
+                  if stack:
+                      stack.pop()
+              i += 1
+
+          if not stack:
+              raise SystemExit("ERROR: Could not identify Kotlin scope.")
+
+          depth = 1
+          scope_end = None
+          i = declaration_start + 2
+
+          while i < len(source):
+              skipped = skip_non_code(source, i)
+              if skipped != i:
+                  i = skipped
+                  continue
+
+              if source[i] == "{":
+                  depth += 1
+              elif source[i] == "}":
+                  depth -= 1
+                  if depth == 0:
+                      scope_end = i
+                      break
+              i += 1
+
+          if scope_end is None:
+              raise SystemExit("ERROR: Could not find end of Kotlin scope.")
+
+          # Locate actual code identifiers, excluding comments and strings.
+          occurrences = []
+          i = declaration_start
+
+          while i < scope_end:
+              skipped = skip_non_code(source, i)
+              if skipped != i:
+                  i = skipped
+                  continue
+
+              if source[i].isalpha() or source[i] == "_":
+                  start = i
+                  i += 1
+                  while i < scope_end and (
+                      source[i].isalnum() or source[i] == "_"
+                  ):
+                      i += 1
+
+                  if source[start:i] == "fl":
+                      occurrences.append((start, i))
+              else:
+                  i += 1
+
+          if not occurrences or occurrences[0][0] != declaration_start:
+              raise SystemExit("ERROR: Could not verify target variable.")
+
+          replacement = "fl_ui_962"
+
+          if replacement in source:
+              raise SystemExit("ERROR: Replacement identifier already exists.")
+
+          for start, end in reversed(occurrences):
+              source = source[:start] + replacement + source[end:]
+
+          path.write_text(source, encoding="utf-8")
+
+          print("Fixed duplicate declaration at line 962.")
+          print(f"Renamed second variable and its references to {replacement}.")
+          print("Both UI sections were preserved.")
+
+      - name: Check patch formatting
+        run: git diff --check
+
+      - name: Run logic tests
+        run: python tests/logic_tests.py
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK packages
+        run: |
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v6
+        with:
+          gradle-version: '8.9'
 
       - name: Build debug APK
-        working-directory: ${{ steps.find.outputs.dir }}
-        run: gradle assembleDebug --stacktrace --no-daemon
+        run: gradle --no-daemon --stacktrace :app:assembleDebug
 
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
+      - name: Upload LuminFish 2.6 APK
+        uses: actions/upload-artifact@v6
         with:
-          name: SolMacro-apk
-          path: ${{ steps.find.outputs.dir }}/app/build/outputs/apk/debug/*.apk
+          name: LuminFish-2.6-debug-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          retention-days: 14
 
-      - name: Upload build reports (only when the build fails)
+      - name: Upload build reports on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
-          name: build-reports
+          name: LuminFish-2.6-build-reports
           path: |
-            ${{ steps.find.outputs.dir }}/app/build/reports
-            ${{ steps.find.outputs.dir }}/app/build/outputs/logs
+            app/build/reports
+            app/build/outputs/logs
           if-no-files-found: ignore
+          retention-days: 7
